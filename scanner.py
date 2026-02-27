@@ -146,55 +146,77 @@ def _lp_defaults():
     return {"lp_locked": "N/A", "lp_lock_duration": "N/A", "lp_liquidity_usd": 0, "volume_24h": 0, "price": 0, "market_cap": 0}
 
 
-# ── Supply concentration — Birdeye token holder ───────────────────────────────
+# ── Supply concentration — Helius RPC getTokenAccounts ───────────────────────
 async def scan_supply(session: aiohttp.ClientSession, ca: str) -> dict:
     try:
-        headers = {"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
-        url = f"{BIRDEYE_API}/v1/token/holder?address={ca}&offset=0&limit=20"
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-            if resp.status != 200:
-                # fallback to old endpoint
-                url2 = f"{BIRDEYE_API}/defi/token_holder?address={ca}&offset=0&limit=20"
-                async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp2:
-                    if resp2.status != 200:
-                        return _supply_defaults()
-                    body = await resp2.json()
-            else:
-                body = await resp.json()
-
-        data = body.get("data", {})
-        # Handle both response shapes
-        holders = data.get("items") or data.get("holders") or []
-
-        if not holders:
+        # Get total supply
+        total_supply = await get_total_supply(session, ca)
+        if not total_supply or total_supply == 0:
             return _supply_defaults()
 
-        # Get total supply from Helius RPC for accurate percentages
-        total_supply = await get_total_supply(session, ca)
+        # Page through top holders using getTokenAccounts
+        all_accounts = []
+        cursor = None
+        for _ in range(3):  # max 3 pages = 300 accounts
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenAccounts",
+                "params": {
+                    "mint": ca,
+                    "limit": 100,
+                    "displayOptions": {"showZeroBalance": False},
+                }
+            }
+            if cursor:
+                payload["params"]["cursor"] = cursor
 
+            async with session.post(HELIUS_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status != 200:
+                    break
+                data = await resp.json()
+
+            result = data.get("result", {})
+            if isinstance(result, dict):
+                accounts = result.get("token_accounts", [])
+                cursor = result.get("cursor")
+            else:
+                break
+
+            all_accounts.extend(accounts)
+            if not cursor or len(accounts) < 100:
+                break
+
+        if not all_accounts:
+            return _supply_defaults()
+
+        # Extract amounts and sort descending
         amounts = []
-        for h in holders:
-            amt = float(h.get("uiAmount") or h.get("amount") or 0)
+        for acc in all_accounts:
+            amt = 0
+            # Helius returns amount in different fields depending on version
+            token_amount = acc.get("tokenAmount") or {}
+            if isinstance(token_amount, dict):
+                amt = float(token_amount.get("uiAmount") or token_amount.get("amount") or 0)
+                if token_amount.get("decimals") and token_amount.get("amount") and not token_amount.get("uiAmount"):
+                    amt = int(token_amount["amount"]) / (10 ** int(token_amount["decimals"]))
+            else:
+                amt = float(acc.get("amount") or 0)
             amounts.append(amt)
 
-        if total_supply and total_supply > 0:
-            shares = [a / total_supply for a in amounts]
-        else:
-            total = sum(amounts)
-            shares = [a / total for a in amounts] if total > 0 else []
-
-        if not shares:
+        amounts = sorted([a for a in amounts if a > 0], reverse=True)
+        if not amounts:
             return _supply_defaults()
 
+        shares = [a / total_supply for a in amounts]
         top10_pct = round(sum(shares[:10]) * 100, 1)
-        top1_pct  = round(shares[0] * 100, 2) if shares else 0
+        top1_pct  = round(shares[0] * 100, 2)
         gini = round(compute_gini(shares), 2)
 
         return {
             "top10_pct": top10_pct,
             "top1_pct": top1_pct,
             "gini": gini,
-            "holder_count": len(holders),
+            "holder_count": len(amounts),
         }
     except Exception as e:
         return _supply_defaults()
