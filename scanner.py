@@ -19,14 +19,16 @@ BIRDEYE_API = "https://public-api.birdeye.so"
 # ── Main entry ────────────────────────────────────────────────────────────────
 async def scan_token(ca: str) -> dict:
     async with aiohttp.ClientSession() as session:
-        wallet_data, lp_data, supply_data, mev_data = await asyncio.gather(
+        wallet_data, lp_data, supply_data, mev_data, dev_data = await asyncio.gather(
             scan_wallets(session, ca),
             scan_lp(session, ca),
             scan_supply(session, ca),
             scan_mev(session, ca),
+            get_dev_alpha(ca),
         )
 
     combined = {**wallet_data, **lp_data, **supply_data, **mev_data}
+    combined["dev"] = dev_data
 
     ws = score_wallets(wallet_data)
     ls = score_lp(lp_data)
@@ -385,3 +387,288 @@ def generate_summary(d, ws, ls, ss, ms) -> str:
     action   = " ".join(advice) if advice else "Always verify LP lock status before trading."
 
     return f"{opener} {flag_str} {action}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEV ALPHA — finds the deployer and their full launch history
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def get_dev_alpha(ca: str) -> dict:
+    """
+    Full dev history analysis:
+    1. Find mint authority (or deployer from tx history if renounced)
+    2. Find all tokens this wallet deployed in last 60 days
+    3. Cross-reference with DexScreener for peak market caps
+    4. Return a structured report
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    async with aiohttp.ClientSession() as session:
+        # Step 1: get deployer wallet
+        deployer = await get_deployer(session, ca)
+        logger.info(f"[DEV] deployer={deployer}")
+
+        if not deployer:
+            return {"error": "Could not identify deployer wallet."}
+
+        # Step 2: get all tokens they deployed
+        tokens = await get_deployed_tokens(session, deployer)
+        logger.info(f"[DEV] found {len(tokens)} deployed tokens")
+
+        if not tokens:
+            return {
+                "deployer": deployer,
+                "token_count": 0,
+                "tokens": [],
+                "summary": f"Deployer `{deployer[:6]}...{deployer[-4:]}` has no other token launches found in recent history."
+            }
+
+        # Step 3: enrich with DexScreener data
+        enriched = await enrich_with_dexscreener(session, tokens)
+
+        # Step 4: build report
+        return build_dev_report(deployer, ca, enriched)
+
+
+# ── Step 1: Find deployer ─────────────────────────────────────────────────────
+async def get_deployer(session: aiohttp.ClientSession, ca: str) -> str:
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        # First try: get mint authority from getAccountInfo
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [ca, {"encoding": "jsonParsed"}]
+        }
+        async with session.post(HELIUS_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json()
+
+        parsed = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {})
+        mint_authority = parsed.get("info", {}).get("mintAuthority")
+        logger.info(f"[DEV] mintAuthority={mint_authority}")
+
+        if mint_authority and mint_authority != "null":
+            return mint_authority
+
+        # Mint authority is null (renounced) — find original deployer from tx history
+        # Get earliest transactions for this mint address
+        sigs_payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [ca, {"limit": 10, "commitment": "finalized"}]
+        }
+        async with session.post(HELIUS_RPC, json=sigs_payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            sigs_data = await resp.json()
+
+        signatures = sigs_data.get("result", [])
+        if not signatures:
+            return None
+
+        # The last signature in the list is the oldest = creation tx
+        oldest_sig = signatures[-1].get("signature")
+        if not oldest_sig:
+            return None
+
+        # Get the transaction detail
+        tx_payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTransaction",
+            "params": [oldest_sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+        }
+        async with session.post(HELIUS_RPC, json=tx_payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            tx_data = await resp.json()
+
+        # The fee payer of the creation tx is the deployer
+        account_keys = tx_data.get("result", {}).get("transaction", {}).get("message", {}).get("accountKeys", [])
+        for key in account_keys:
+            if isinstance(key, dict) and key.get("signer") and key.get("writable"):
+                return key.get("pubkey")
+            elif isinstance(key, str):
+                return key  # fallback: first account is usually fee payer
+
+        return None
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[DEV] get_deployer error: {e}")
+        return None
+
+
+# ── Step 2: Find all tokens deployed by this wallet ──────────────────────────
+async def get_deployed_tokens(session: aiohttp.ClientSession, deployer: str) -> list:
+    import logging, time
+    logger = logging.getLogger(__name__)
+    try:
+        # Use Helius enhanced transactions API to find InitializeMint instructions
+        url = f"{HELIUS_API}/addresses/{deployer}/transactions?api-key={HELIUS_API_KEY}&limit=100&type=CREATE"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                # fallback: get all transactions and filter
+                url2 = f"{HELIUS_API}/addresses/{deployer}/transactions?api-key={HELIUS_API_KEY}&limit=100"
+                async with session.get(url2, timeout=aiohttp.ClientTimeout(total=12)) as resp2:
+                    txs = await resp2.json() if resp2.status == 200 else []
+            else:
+                txs = await resp.json()
+
+        if not isinstance(txs, list):
+            return []
+
+        # Filter to last 60 days
+        cutoff = time.time() - (60 * 86400)
+        token_mints = []
+        seen = set()
+
+        for tx in txs:
+            ts = tx.get("timestamp", 0)
+            if ts < cutoff:
+                continue
+
+            # Look for token mint addresses in the instructions
+            for instruction in tx.get("instructions", []):
+                if instruction.get("programId") == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
+                    accounts = instruction.get("accounts", [])
+                    if accounts and accounts[0] not in seen:
+                        seen.add(accounts[0])
+                        token_mints.append({
+                            "mint": accounts[0],
+                            "timestamp": ts
+                        })
+
+            # Also check tokenTransfers for minted tokens
+            for transfer in tx.get("tokenTransfers", []):
+                mint = transfer.get("mint", "")
+                if mint and mint not in seen:
+                    seen.add(mint)
+                    token_mints.append({
+                        "mint": mint,
+                        "timestamp": ts
+                    })
+
+        logger.info(f"[DEV] raw token mints found: {len(token_mints)}")
+        return token_mints[:20]  # cap at 20 to avoid rate limits
+
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[DEV] get_deployed_tokens error: {e}")
+        return []
+
+
+# ── Step 3: Enrich with DexScreener ──────────────────────────────────────────
+async def enrich_with_dexscreener(session: aiohttp.ClientSession, tokens: list) -> list:
+    import logging
+    logger = logging.getLogger(__name__)
+    enriched = []
+
+    # DexScreener allows batch of up to 30 addresses
+    mints = [t["mint"] for t in tokens]
+    chunks = [mints[i:i+29] for i in range(0, len(mints), 29)]
+
+    dex_data = {}
+    for chunk in chunks:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    for pair in result.get("pairs", []) or []:
+                        mint = pair.get("baseToken", {}).get("address", "")
+                        if mint and mint not in dex_data:
+                            dex_data[mint] = pair
+            await asyncio.sleep(0.5)  # rate limit
+        except Exception as e:
+            logger.error(f"[DEV] dexscreener error: {e}")
+
+    for token in tokens:
+        mint = token["mint"]
+        pair = dex_data.get(mint, {})
+        name = pair.get("baseToken", {}).get("name", "Unknown")
+        symbol = pair.get("baseToken", {}).get("symbol", "???")
+        mc = pair.get("fdv") or pair.get("marketCap") or 0
+        price_usd = pair.get("priceUsd", "0")
+        volume_24h = pair.get("volume", {}).get("h24", 0)
+        price_change = pair.get("priceChange", {}).get("h24", 0)
+
+        try:
+            mc = float(mc)
+        except Exception:
+            mc = 0
+
+        enriched.append({
+            "mint": mint,
+            "name": name,
+            "symbol": symbol,
+            "market_cap": mc,
+            "price_usd": price_usd,
+            "volume_24h": volume_24h,
+            "price_change_24h": price_change,
+            "timestamp": token.get("timestamp", 0),
+            "on_dex": bool(pair),
+        })
+
+    # Sort by market cap descending
+    enriched.sort(key=lambda x: x["market_cap"], reverse=True)
+    return enriched
+
+
+# ── Step 4: Build the report ──────────────────────────────────────────────────
+def build_dev_report(deployer: str, current_ca: str, tokens: list) -> dict:
+    import time
+
+    total = len(tokens)
+    on_dex = [t for t in tokens if t["on_dex"]]
+    dead = [t for t in tokens if not t["on_dex"]]
+
+    biggest = on_dex[0] if on_dex else None
+    biggest_mc = biggest["market_cap"] if biggest else 0
+
+    # Format market cap
+    def fmt_mc(mc):
+        if mc >= 1_000_000:
+            return f"${mc/1_000_000:.2f}M"
+        elif mc >= 1_000:
+            return f"${mc/1_000:.1f}K"
+        else:
+            return f"${mc:.0f}"
+
+    # Risk assessment based on history
+    if total == 0:
+        risk = "🟡 No history found"
+        risk_note = "First launch or wallet is new."
+    elif len(dead) > len(on_dex) and total > 2:
+        risk = "🔴 Serial launcher"
+        risk_note = f"{len(dead)}/{total} previous tokens are dead or untraded."
+    elif biggest_mc > 1_000_000:
+        risk = "🟢 Proven dev"
+        risk_note = f"Has launched a token that hit {fmt_mc(biggest_mc)}."
+    elif biggest_mc > 100_000:
+        risk = "🟡 Some track record"
+        risk_note = f"Best previous launch peaked at {fmt_mc(biggest_mc)}."
+    else:
+        risk = "🟠 Low track record"
+        risk_note = "No significant previous launches found."
+
+    # Build token list string (top 5)
+    token_lines = []
+    for i, t in enumerate(tokens[:5], 1):
+        mc_str = fmt_mc(t["market_cap"]) if t["market_cap"] > 0 else "Dead/No data"
+        token_lines.append(f"{i}. {t['name']} (${t['symbol']}) — {mc_str}")
+
+    summary = (
+        f"This dev has launched {total} token(s) in the last 60 days. "
+    )
+    if biggest:
+        summary += f"Their biggest success was {biggest['name']} (${biggest['symbol']}) which hit {fmt_mc(biggest_mc)}."
+    else:
+        summary += "None of their previous tokens are currently trading on DEX."
+
+    return {
+        "deployer": deployer,
+        "token_count": total,
+        "tokens": tokens,
+        "token_lines": token_lines,
+        "biggest_launch": biggest,
+        "biggest_mc": biggest_mc,
+        "dead_count": len(dead),
+        "risk": risk,
+        "risk_note": risk_note,
+        "summary": summary,
+    }
