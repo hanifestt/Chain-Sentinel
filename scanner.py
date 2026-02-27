@@ -436,7 +436,7 @@ async def get_deployer(session: aiohttp.ClientSession, ca: str) -> str:
     import logging
     logger = logging.getLogger(__name__)
     try:
-        # First try: get mint authority from getAccountInfo
+        # Method 1: get mint authority from getAccountInfo
         payload = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getAccountInfo",
@@ -446,18 +446,22 @@ async def get_deployer(session: aiohttp.ClientSession, ca: str) -> str:
             data = await resp.json()
 
         parsed = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {})
-        mint_authority = parsed.get("info", {}).get("mintAuthority")
-        logger.info(f"[DEV] mintAuthority={mint_authority}")
+        info   = parsed.get("info", {}) if isinstance(parsed, dict) else {}
+        mint_authority = info.get("mintAuthority")
+        freeze_authority = info.get("freezeAuthority")
+        logger.info(f"[DEV] mintAuthority={mint_authority} freezeAuthority={freeze_authority}")
 
-        if mint_authority and mint_authority != "null":
+        if mint_authority and mint_authority not in ("null", None, ""):
             return mint_authority
+        if freeze_authority and freeze_authority not in ("null", None, ""):
+            return freeze_authority
 
-        # Mint authority is null (renounced) — find original deployer from tx history
-        # Get earliest transactions for this mint address
+        # Method 2: trace back to creation tx via getSignaturesForAddress
+        # Get ALL signatures to find the very first one (creation)
         sigs_payload = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getSignaturesForAddress",
-            "params": [ca, {"limit": 10, "commitment": "finalized"}]
+            "params": [ca, {"limit": 1000, "commitment": "finalized"}]
         }
         async with session.post(HELIUS_RPC, json=sigs_payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             sigs_data = await resp.json()
@@ -466,12 +470,14 @@ async def get_deployer(session: aiohttp.ClientSession, ca: str) -> str:
         if not signatures:
             return None
 
-        # The last signature in the list is the oldest = creation tx
+        # Last sig = oldest = creation tx
         oldest_sig = signatures[-1].get("signature")
         if not oldest_sig:
             return None
 
-        # Get the transaction detail
+        logger.info(f"[DEV] creation sig={oldest_sig[:20]}...")
+
+        # Get full transaction
         tx_payload = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
@@ -480,17 +486,36 @@ async def get_deployer(session: aiohttp.ClientSession, ca: str) -> str:
         async with session.post(HELIUS_RPC, json=tx_payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             tx_data = await resp.json()
 
-        # The fee payer of the creation tx is the deployer
-        account_keys = tx_data.get("result", {}).get("transaction", {}).get("message", {}).get("accountKeys", [])
+        result = tx_data.get("result", {})
+        if not result:
+            return None
+
+        # Fee payer is always index 0 in accountKeys and is the deployer
+        account_keys = result.get("transaction", {}).get("message", {}).get("accountKeys", [])
         for key in account_keys:
-            if isinstance(key, dict) and key.get("signer") and key.get("writable"):
-                return key.get("pubkey")
-            elif isinstance(key, str):
-                return key  # fallback: first account is usually fee payer
+            if isinstance(key, dict):
+                if key.get("signer") and key.get("writable"):
+                    deployer = key.get("pubkey", "")
+                    if deployer and deployer != ca:
+                        logger.info(f"[DEV] deployer from tx={deployer}")
+                        return deployer
+            elif isinstance(key, str) and key != ca:
+                return key
+
+        # Method 3: Helius enhanced tx endpoint - feePayer field
+        helius_url = f"{HELIUS_API}/transactions/?api-key={HELIUS_API_KEY}"
+        async with session.post(helius_url, json={"transactions": [oldest_sig]}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                txs = await resp.json()
+                if isinstance(txs, list) and txs:
+                    fee_payer = txs[0].get("feePayer", "")
+                    if fee_payer and fee_payer != ca:
+                        logger.info(f"[DEV] deployer from Helius enhanced={fee_payer}")
+                        return fee_payer
 
         return None
     except Exception as e:
-        logging.getLogger(__name__).error(f"[DEV] get_deployer error: {e}")
+        logging.getLogger(__name__).error(f"[DEV] get_deployer error: {e}", exc_info=True)
         return None
 
 
@@ -498,57 +523,143 @@ async def get_deployer(session: aiohttp.ClientSession, ca: str) -> str:
 async def get_deployed_tokens(session: aiohttp.ClientSession, deployer: str) -> list:
     import logging, time
     logger = logging.getLogger(__name__)
+    TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    TOKEN_2022    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+    cutoff = time.time() - (60 * 86400)
+
     try:
-        # Use Helius enhanced transactions API to find InitializeMint instructions
-        url = f"{HELIUS_API}/addresses/{deployer}/transactions?api-key={HELIUS_API_KEY}&limit=100&type=CREATE"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-            if resp.status != 200:
-                # fallback: get all transactions and filter
-                url2 = f"{HELIUS_API}/addresses/{deployer}/transactions?api-key={HELIUS_API_KEY}&limit=100"
-                async with session.get(url2, timeout=aiohttp.ClientTimeout(total=12)) as resp2:
-                    txs = await resp2.json() if resp2.status == 200 else []
-            else:
+        # ── Strategy 1: Helius enhanced API (parsed transactions) ──
+        seen = set()
+        token_mints = []
+
+        # Try multiple pages to get enough history
+        before = None
+        for page in range(5):  # up to 500 txs
+            url = f"{HELIUS_API}/addresses/{deployer}/transactions?api-key={HELIUS_API_KEY}&limit=100"
+            if before:
+                url += f"&before={before}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status != 200:
+                    break
                 txs = await resp.json()
 
-        if not isinstance(txs, list):
-            return []
+            if not isinstance(txs, list) or not txs:
+                break
 
-        # Filter to last 60 days
-        cutoff = time.time() - (60 * 86400)
-        token_mints = []
-        seen = set()
+            oldest_ts = None
+            for tx in txs:
+                ts = tx.get("timestamp", 0)
+                if oldest_ts is None or ts < oldest_ts:
+                    oldest_ts = ts
 
-        for tx in txs:
-            ts = tx.get("timestamp", 0)
-            if ts < cutoff:
-                continue
+                # Skip if older than 60 days
+                if ts < cutoff:
+                    continue
 
-            # Look for token mint addresses in the instructions
-            for instruction in tx.get("instructions", []):
-                if instruction.get("programId") == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
-                    accounts = instruction.get("accounts", [])
-                    if accounts and accounts[0] not in seen:
-                        seen.add(accounts[0])
-                        token_mints.append({
-                            "mint": accounts[0],
-                            "timestamp": ts
-                        })
+                tx_type = tx.get("type", "")
 
-            # Also check tokenTransfers for minted tokens
-            for transfer in tx.get("tokenTransfers", []):
-                mint = transfer.get("mint", "")
-                if mint and mint not in seen:
-                    seen.add(mint)
-                    token_mints.append({
-                        "mint": mint,
-                        "timestamp": ts
-                    })
+                # Method A: Helius marks these as TOKEN_MINT or CREATE
+                if tx_type in ("TOKEN_MINT", "CREATE", "INIT_MINT", "EXECUTE"):
+                    for transfer in tx.get("tokenTransfers", []):
+                        mint = transfer.get("mint", "")
+                        from_addr = transfer.get("fromUserAccount", "")
+                        # Only count if deployer is the source (minting)
+                        if mint and mint not in seen and (from_addr == deployer or from_addr == ""):
+                            seen.add(mint)
+                            token_mints.append({"mint": mint, "timestamp": ts})
 
-        logger.info(f"[DEV] raw token mints found: {len(token_mints)}")
-        return token_mints[:20]  # cap at 20 to avoid rate limits
+                # Method B: scan ALL token transfers regardless of type
+                for transfer in tx.get("tokenTransfers", []):
+                    mint = transfer.get("mint", "")
+                    from_addr = transfer.get("fromUserAccount", "")
+                    to_addr   = transfer.get("toUserAccount", "")
+                    # A mint event has empty fromUserAccount (tokens created from nothing)
+                    if mint and mint not in seen and from_addr == "" and to_addr == deployer:
+                        seen.add(mint)
+                        token_mints.append({"mint": mint, "timestamp": ts})
+
+                # Method C: scan instructions for InitializeMint
+                for ix in tx.get("instructions", []):
+                    prog = ix.get("programId", "")
+                    if prog not in (TOKEN_PROGRAM, TOKEN_2022):
+                        continue
+                    parsed = ix.get("parsed", {})
+                    ix_type = parsed.get("type", "") if isinstance(parsed, dict) else ""
+                    if "initializeMint" in ix_type.lower():
+                        info = parsed.get("info", {}) if isinstance(parsed, dict) else {}
+                        mint = info.get("mint", "")
+                        if mint and mint not in seen:
+                            seen.add(mint)
+                            token_mints.append({"mint": mint, "timestamp": ts})
+
+                # Method D: check inner instructions too
+                for inner in tx.get("innerInstructions", []):
+                    for ix in inner.get("instructions", []):
+                        prog = ix.get("programId", "")
+                        if prog not in (TOKEN_PROGRAM, TOKEN_2022):
+                            continue
+                        parsed = ix.get("parsed", {})
+                        ix_type = parsed.get("type", "") if isinstance(parsed, dict) else ""
+                        if "initializeMint" in ix_type.lower():
+                            info = parsed.get("info", {}) if isinstance(parsed, dict) else {}
+                            mint = info.get("mint", "")
+                            if mint and mint not in seen:
+                                seen.add(mint)
+                                token_mints.append({"mint": mint, "timestamp": ts})
+
+            # Stop paginating if we've gone past 60 days
+            if oldest_ts and oldest_ts < cutoff:
+                break
+            # Set cursor for next page
+            before = txs[-1].get("signature") if txs else None
+            if not before:
+                break
+
+        logger.info(f"[DEV] Strategy 1 found {len(token_mints)} mints")
+
+        # ── Strategy 2: Solscan API as fallback if we found nothing ──
+        if not token_mints:
+            logger.info("[DEV] Trying Solscan fallback...")
+            try:
+                solscan_url = f"https://pro-api.solscan.io/v2.0/account/token-accounts?address={deployer}&type=token&page=1&page_size=40"
+                headers = {"token": os.environ.get("SOLSCAN_API_KEY", "")}
+                async with session.get(solscan_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for item in data.get("data", []):
+                            mint = item.get("tokenAddress", "")
+                            ts   = item.get("blockTime", 0)
+                            if mint and mint not in seen and ts >= cutoff:
+                                seen.add(mint)
+                                token_mints.append({"mint": mint, "timestamp": ts})
+                        logger.info(f"[DEV] Solscan fallback found {len(token_mints)} tokens")
+            except Exception as e2:
+                logger.warning(f"[DEV] Solscan fallback failed: {e2}")
+
+        # ── Strategy 3: Use DexScreener directly on deployer ──
+        if not token_mints:
+            logger.info("[DEV] Trying DexScreener search fallback...")
+            try:
+                dex_url = f"https://api.dexscreener.com/latest/dex/search?q={deployer}"
+                async with session.get(dex_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for pair in data.get("pairs", []) or []:
+                            if pair.get("chainId") != "solana":
+                                continue
+                            mint = pair.get("baseToken", {}).get("address", "")
+                            if mint and mint not in seen:
+                                seen.add(mint)
+                                token_mints.append({"mint": mint, "timestamp": int(time.time())})
+                        logger.info(f"[DEV] DexScreener fallback found {len(token_mints)} tokens")
+            except Exception as e3:
+                logger.warning(f"[DEV] DexScreener fallback failed: {e3}")
+
+        logger.info(f"[DEV] Total unique mints found: {len(token_mints)}")
+        return token_mints[:25]
 
     except Exception as e:
-        logging.getLogger(__name__).error(f"[DEV] get_deployed_tokens error: {e}")
+        logging.getLogger(__name__).error(f"[DEV] get_deployed_tokens error: {e}", exc_info=True)
         return []
 
 
@@ -672,3 +783,7 @@ def build_dev_report(deployer: str, current_ca: str, tokens: list) -> dict:
         "risk_note": risk_note,
         "summary": summary,
     }
+
+
+
+
