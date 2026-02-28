@@ -309,7 +309,7 @@ def format_smart_money_report(result: dict) -> str:
         f"",
         f"Tokens analysed: `{len(mints)}`",
         f"Common wallets found: `{total_common}`",
-        f"Passed filters (>{min_wr}% WR, >{min_pnl} SOL PnL): `{len(qualified)}`",
+        f"100% Win Rate wallets: `{len(qualified)}`",
         f"",
     ]
 
