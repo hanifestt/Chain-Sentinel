@@ -1,444 +1,399 @@
+"""
+smartmoney.py — Smart Money Wallet Finder for Chain Sentinel
+Finds wallets that appear across multiple successful tokens, filters by PnL & win rate.
+"""
+
 import os
 import asyncio
+import aiohttp
 import json
+import time
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
-from scanner import scan_token, get_dev_alpha
-from smartmoney import find_smart_money, format_smart_money_report
-from watchlist import add_to_watchlist, remove_from_watchlist, get_watchlist, check_watchlist_alerts
-from invites import generate_invite, use_invite, is_authorized, authorize_user, list_invites
+from collections import defaultdict
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "chainsentinel_bot")
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
+HELIUS_RPC     = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HELIUS_API     = "https://api.helius.xyz/v0"
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 
-def require_auth(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id == ADMIN_ID or is_authorized(user_id):
-            return await func(update, context)
-        else:
-            await update.message.reply_text(
-                "🔒 *Access Denied*\n\nChain Sentinel is invite-only.\nYou need a valid invite link to access this bot.",
-                parse_mode="Markdown"
-            )
-    return wrapper
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def find_smart_money(mints: list, min_win_rate: float = 0.60, min_pnl_sol: float = 10.0) -> dict:
+    """
+    Given a list of 2-5 mint addresses, find smart money wallets.
+    Returns a report dict.
+    """
+    if len(mints) < 2:
+        return {"error": "Please provide at least 2 contract addresses."}
+    if len(mints) > 5:
+        mints = mints[:5]
+
+    async with aiohttp.ClientSession() as session:
+
+        # ── Step 1: Get top holders for each mint ─────────────────────────────
+        logger.info(f"[SM] Fetching holders for {len(mints)} tokens...")
+        holder_lists = await asyncio.gather(*[
+            get_top_holders(session, mint) for mint in mints
+        ])
+
+        # ── Step 2: Find intersection (wallets in 2+ lists) ───────────────────
+        common = find_intersection(holder_lists, mints, min_appearances=2)
+        logger.info(f"[SM] Found {len(common)} common wallets")
+
+        if not common:
+            return {
+                "error": "No common wallets found across these tokens. Try tokens with more overlap.",
+                "holder_counts": [len(h) for h in holder_lists],
+            }
+
+        # Limit to top 30 wallets to avoid rate limits
+        common_wallets = list(common.keys())[:30]
+
+        # ── Step 3: Calculate PnL for each common wallet ───────────────────────
+        logger.info(f"[SM] Calculating PnL for {len(common_wallets)} wallets...")
+        pnl_results = await asyncio.gather(*[
+            calculate_wallet_pnl(session, wallet, mints) for wallet in common_wallets
+        ])
+
+        # ── Step 4: Filter by win rate and PnL ────────────────────────────────
+        qualified = []
+        for wallet, pnl_data in zip(common_wallets, pnl_results):
+            if pnl_data is None:
+                continue
+            win_rate = pnl_data.get("win_rate", 0)
+            total_pnl = pnl_data.get("total_pnl_sol", 0)
+            if win_rate >= min_win_rate and total_pnl >= min_pnl_sol:
+                pnl_data["wallet"] = wallet
+                pnl_data["tokens_held"] = common[wallet]
+                qualified.append(pnl_data)
+
+        # Sort by total PnL descending
+        qualified.sort(key=lambda x: x.get("total_pnl_sol", 0), reverse=True)
+        logger.info(f"[SM] {len(qualified)} wallets passed filters")
+
+        return {
+            "mints_analyzed": mints,
+            "total_common_wallets": len(common),
+            "qualified_wallets": qualified[:10],  # top 10
+            "min_win_rate": min_win_rate,
+            "min_pnl_sol": min_pnl_sol,
+        }
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_name = update.effective_user.first_name or "trader"
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — GET TOP HOLDERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    if context.args:
-        token = context.args[0]
-        if is_authorized(user_id) or user_id == ADMIN_ID:
-            await send_welcome(update, user_name)
-            return
-        success = use_invite(token, user_id)
-        if success:
-            await update.message.reply_text(
-                f"✅ *Invite accepted!* Welcome, {user_name}.\n\nYou now have full access to Chain Sentinel.",
-                parse_mode="Markdown"
-            )
-            await send_welcome(update, user_name)
-        else:
-            await update.message.reply_text(
-                "❌ *Invalid or already used invite link.*\n\nThis link has already been redeemed.\nContact the admin for a new invite.",
-                parse_mode="Markdown"
-            )
-        return
-
-    if is_authorized(user_id) or user_id == ADMIN_ID:
-        await send_welcome(update, user_name)
-    else:
-        await update.message.reply_text(
-            "🔒 *Chain Sentinel is invite-only.*\n\nYou need a valid invite link to access this bot.",
-            parse_mode="Markdown"
-        )
-
-
-async def send_welcome(update: Update, name: str):
-    text = (
-        f"👁 *CHAIN SENTINEL* — Welcome, {name}\n\n"
-        "Send me any Solana contract address and I'll scan it for:\n"
-        "• Wallet clustering & snipers\n"
-        "• LP lock status\n"
-        "• Supply concentration\n"
-        "• MEV bot exposure\n\n"
-        "*Commands:*\n"
-        "/scan `<CA>` — Full risk scan\n"
-        "/dev `<CA>` — Dev history & alpha\n"
-        "/smartmoney `<CA1> <CA2>` — Find smart money wallets\n"
-        "/watch `<CA>` — Add to watchlist\n"
-        "/unwatch `<CA>` — Remove from watchlist\n"
-        "/watchlist — View your watchlist\n\n"
-        "_Paste a contract address to get started ↓_"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def genlink_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    count = 1
-    if context.args and context.args[0].isdigit():
-        count = min(int(context.args[0]), 20)
-    lines = [f"🔑 *Generated {count} invite link(s):*\n"]
-    for _ in range(count):
-        token = generate_invite()
-        link = f"https://t.me/{BOT_USERNAME}?start={token}"
-        lines.append(f"`{link}`")
-    lines.append("\n_Each link can only be used once._")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def invites_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    invites = list_invites()
-    if not invites:
-        await update.message.reply_text("No invites yet. Use /genlink to create one.")
-        return
-    used = sum(1 for v in invites.values() if v["used"])
-    unused = len(invites) - used
-    lines = [f"📋 *Invite Summary:*", f"Total: {len(invites)} | Used: {used} | Available: {unused}\n"]
-    for token, meta in list(invites.items())[-10:]:
-        status = "✅ Used" if meta["used"] else "⏳ Available"
-        lines.append(f"`...{token[-8:]}` — {status}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /adduser <telegram_user_id>")
-        return
-    authorize_user(int(context.args[0]))
-    await update.message.reply_text(f"✅ User `{context.args[0]}` authorized.", parse_mode="Markdown")
-
-
-@require_auth
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_welcome(update, update.effective_user.first_name or "trader")
-
-
-@require_auth
-async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /scan <contract_address>")
-        return
-    await run_scan(update, context, context.args[0].strip())
-
-
-@require_auth
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if 32 <= len(text) <= 44 and text.isalnum():
-        await run_scan(update, context, text)
-    else:
-        await update.message.reply_text("Send me a Solana contract address to scan, or use /help.")
-
-
-async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, ca: str):
-    msg = await update.message.reply_text(
-        f"🔍 Scanning `{ca[:8]}...{ca[-4:]}`\nFetching token data, please wait...",
-        parse_mode="Markdown"
-    )
+async def get_top_holders(session: aiohttp.ClientSession, mint: str) -> list:
+    """Returns list of top 100 holder wallet addresses for a mint."""
     try:
-        result = await scan_token(ca)
-        text = format_report(ca, result)
-        keyboard = [[
-            InlineKeyboardButton("👁 Watch Token", callback_data=f"watch:{ca}"),
-            InlineKeyboardButton("🔗 Pump.fun", url=f"https://pump.fun/coin/{ca}")
-        ]]
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        # Use getTokenLargestAccounts to get top 20 (Solana RPC limit)
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenLargestAccounts",
+            "params": [mint]
+        }
+        async with session.post(HELIUS_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            data = await resp.json()
+
+        accounts = data.get("result", {}).get("value", [])
+        token_account_addresses = [acc["address"] for acc in accounts if acc.get("address")]
+
+        if not token_account_addresses:
+            return []
+
+        # Convert token accounts to owner wallets
+        owners = await get_account_owners(session, token_account_addresses)
+        logger.info(f"[SM] {mint[:8]}... has {len(owners)} holders")
+        return owners
+
     except Exception as e:
-        logger.error(f"Scan error: {e}")
-        await msg.edit_text(f"❌ Scan failed for `{ca[:8]}...`\n\nMake sure it's a valid Solana CA.", parse_mode="Markdown")
+        logger.error(f"[SM] get_top_holders error for {mint[:8]}: {e}")
+        return []
 
 
-def format_report(ca: str, r: dict) -> str:
-    score = r.get("risk_score", 0)
-    if score <= 30:   verdict = "🟢 LOW RISK"
-    elif score <= 60: verdict = "🟡 MEDIUM RISK"
-    elif score <= 80: verdict = "🟠 HIGH RISK"
-    else:             verdict = "🔴 CRITICAL RISK"
+async def get_account_owners(session: aiohttp.ClientSession, token_accounts: list) -> list:
+    """Batch convert token accounts to owner wallet addresses."""
+    owners = []
+    try:
+        # getMultipleAccounts in one RPC call
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getMultipleAccounts",
+            "params": [token_accounts, {"encoding": "jsonParsed"}]
+        }
+        async with session.post(HELIUS_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            data = await resp.json()
 
-    def fmt_mc(mc):
-        try:
-            mc = float(mc)
-            if mc >= 1_000_000: return f"${mc/1_000_000:.2f}M"
-            elif mc >= 1_000:   return f"${mc/1_000:.1f}K"
-            else:               return f"${mc:.0f}"
-        except: return "N/A"
+        for account in data.get("result", {}).get("value", []) or []:
+            if not account:
+                continue
+            parsed = account.get("data", {}).get("parsed", {})
+            owner = parsed.get("info", {}).get("owner", "")
+            if owner:
+                owners.append(owner)
+    except Exception as e:
+        logger.error(f"[SM] get_account_owners error: {e}")
+    return owners
 
-    # Build dev section
-    dev = r.get("dev", {})
-    deployer = dev.get("deployer", "N/A")
-    dev_short = f"`{deployer[:8]}...{deployer[-4:]}`" if deployer and deployer != "N/A" else "`N/A`"
-    dev_risk = dev.get("risk", "N/A")
-    dev_note = dev.get("risk_note", "")
-    token_count = dev.get("token_count", 0)
-    dead_count = dev.get("dead_count", 0)
-    biggest_mc = dev.get("biggest_mc", 0)
-    token_lines = dev.get("token_lines", [])
-    dev_summary = dev.get("summary", "No dev history found.")
 
-    name   = r.get("token_name", "Unknown")
-    symbol = r.get("token_symbol", "???")
-    header = f"*{name}* (${symbol})" if name != "Unknown" else f"`{ca}`"
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — FIND INTERSECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def find_intersection(holder_lists: list, mints: list, min_appearances: int = 2) -> dict:
+    """
+    Find wallets appearing in at least min_appearances token holder lists.
+    Returns dict: {wallet: [list of mints they hold]}
+    """
+    wallet_to_mints = defaultdict(list)
+
+    for mint, holders in zip(mints, holder_lists):
+        for wallet in holders:
+            # Exclude known program addresses
+            if len(wallet) < 32 or wallet in EXCLUDED_PROGRAMS:
+                continue
+            wallet_to_mints[wallet].append(mint)
+
+    # Keep only wallets in 2+ lists
+    common = {
+        wallet: held_mints
+        for wallet, held_mints in wallet_to_mints.items()
+        if len(held_mints) >= min_appearances
+    }
+
+    # Sort by how many tokens they hold (most overlap first)
+    return dict(sorted(common.items(), key=lambda x: len(x[1]), reverse=True))
+
+
+# Known program addresses to exclude
+EXCLUDED_PROGRAMS = {
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "11111111111111111111111111111111",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bfE",
+    "So11111111111111111111111111111111111111112",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — CALCULATE WALLET PNL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def calculate_wallet_pnl(session: aiohttp.ClientSession, wallet: str, mints: list) -> dict:
+    """
+    Fetch last 50 transactions for a wallet and calculate realized PnL.
+    """
+    try:
+        # Get recent transactions via Helius enhanced API
+        url = f"{HELIUS_API}/addresses/{wallet}/transactions?api-key={HELIUS_API_KEY}&limit=50"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return None
+            txs = await resp.json()
+
+        if not isinstance(txs, list) or not txs:
+            return None
+
+        trades = []
+        token_pnl = defaultdict(lambda: {"buy_sol": 0.0, "sell_sol": 0.0, "buy_amount": 0.0, "sell_amount": 0.0})
+        current_holdings = {}
+
+        for tx in txs:
+            tx_type = tx.get("type", "")
+            ts = tx.get("timestamp", 0)
+
+            # Get SOL change for this wallet
+            sol_change = 0.0
+            for change in tx.get("accountData", []):
+                if change.get("account") == wallet:
+                    sol_change = change.get("nativeBalanceChange", 0) / 1e9  # lamports to SOL
+
+            # Analyze token transfers
+            for transfer in tx.get("tokenTransfers", []):
+                mint = transfer.get("mint", "")
+                from_addr = transfer.get("fromUserAccount", "")
+                to_addr   = transfer.get("toUserAccount", "")
+                amount    = float(transfer.get("tokenAmount", 0))
+
+                if not mint or amount == 0:
+                    continue
+
+                if to_addr == wallet and sol_change < 0:
+                    # BUY: wallet received tokens and spent SOL
+                    cost_sol = abs(sol_change)
+                    token_pnl[mint]["buy_sol"]    += cost_sol
+                    token_pnl[mint]["buy_amount"] += amount
+                    trades.append({"type": "BUY", "mint": mint, "sol": cost_sol, "amount": amount, "ts": ts})
+                    current_holdings[mint] = current_holdings.get(mint, 0) + amount
+
+                elif from_addr == wallet and sol_change > 0:
+                    # SELL: wallet sent tokens and received SOL
+                    recv_sol = sol_change
+                    token_pnl[mint]["sell_sol"]    += recv_sol
+                    token_pnl[mint]["sell_amount"] += amount
+                    trades.append({"type": "SELL", "mint": mint, "sol": recv_sol, "amount": amount, "ts": ts})
+                    current_holdings[mint] = max(0, current_holdings.get(mint, 0) - amount)
+
+        if not trades:
+            return None
+
+        # Calculate per-token PnL
+        token_reports = []
+        wins = 0
+        total_pnl = 0.0
+
+        for mint, data in token_pnl.items():
+            bought  = data["buy_sol"]
+            sold    = data["sell_sol"]
+            pnl     = sold - bought
+            total_pnl += pnl
+
+            if bought > 0:
+                roi_pct = ((sold - bought) / bought * 100) if bought > 0 else 0
+                is_win  = pnl > 0
+                if is_win:
+                    wins += 1
+                token_reports.append({
+                    "mint":        mint,
+                    "bought_sol":  round(bought, 4),
+                    "sold_sol":    round(sold, 4),
+                    "pnl_sol":     round(pnl, 4),
+                    "roi_pct":     round(roi_pct, 1),
+                    "holding":     round(current_holdings.get(mint, 0), 2),
+                    "win":         is_win,
+                })
+
+        token_reports.sort(key=lambda x: x["pnl_sol"], reverse=True)
+
+        total_trades = len(token_pnl)
+        win_rate = wins / total_trades if total_trades > 0 else 0
+
+        return {
+            "total_pnl_sol":   round(total_pnl, 4),
+            "win_rate":        round(win_rate, 3),
+            "wins":            wins,
+            "total_positions": total_trades,
+            "token_breakdown": token_reports,
+            "current_holdings": {k: v for k, v in current_holdings.items() if v > 0},
+            "trade_count":     len(trades),
+        }
+
+    except Exception as e:
+        logger.error(f"[SM] PnL error for {wallet[:8]}: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPORT FORMATTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def format_smart_money_report(result: dict) -> str:
+    if result.get("error"):
+        return f"❌ {result['error']}"
+
+    qualified = result.get("qualified_wallets", [])
+    total_common = result.get("total_common_wallets", 0)
+    mints = result.get("mints_analyzed", [])
+    min_wr = int(result.get("min_win_rate", 0.6) * 100)
+    min_pnl = result.get("min_pnl_sol", 10)
 
     lines = [
-        f"👁 *CHAIN SENTINEL REPORT*",
-        f"{header}",
-        f"`{ca}`", f"",
-        f"*Risk Score: {score}/100 — {verdict}*", f"",
-        f"━━━ 💼 WALLET ANALYSIS ━━━",
-        f"• Unique wallets: `{r.get('wallet_count', 'N/A')}`",
-        f"• Clustered/coordinated: `{r.get('cluster_pct', 'N/A')}%`",
-        f"• Fresh wallets (<24h): `{r.get('fresh_wallet_pct', 'N/A')}%`",
-        f"• Wallet risk: `{r.get('wallet_risk', 'N/A')}`", f"",
-        f"━━━ 💧 LIQUIDITY (LP) ━━━",
-        f"• LP status: `{r.get('lp_locked', 'Unknown')}`",
-        f"• LP risk: `{r.get('lp_risk', 'N/A')}`", f"",
-        f"━━━ 📊 SUPPLY CONCENTRATION ━━━",
-        f"• Holder count: `{r.get('holder_count', 'N/A')}`",
-        f"• Top holder: `{r.get('top1_pct', 'N/A')}%`",
-        f"• Top 10 holders: `{r.get('top10_pct', 'N/A')}%`",
-        f"• Gini coefficient: `{r.get('gini', 'N/A')}`",
-        f"• Supply risk: `{r.get('supply_risk', 'N/A')}`", f"",
-        f"━━━ ⚡ MEV EXPOSURE ━━━",
-        f"• Suspected bot wallets: `{r.get('mev_bots', 'N/A')}`",
-        f"• Sandwich patterns: `{r.get('sandwich_count', 'N/A')}`",
-        f"• MEV risk: `{r.get('mev_risk', 'N/A')}`", f"",
-        f"━━━ 👨‍💻 DEV HISTORY ━━━",
-        f"• Deployer: {dev_short}",
-        f"• Launches (60d): `{token_count}` ({dead_count} dead)",
-        f"• Biggest MC: `{fmt_mc(biggest_mc)}`",
-        f"• Dev rating: {dev_risk}",
+        f"🧠 *SMART MONEY REPORT*",
+        f"",
+        f"Tokens analysed: `{len(mints)}`",
+        f"Common wallets found: `{total_common}`",
+        f"100% Win Rate wallets: `{len(qualified)}`",
+        f"",
     ]
 
-    if token_lines:
-        lines.append(f"• Top tokens:")
-        for tl in token_lines[:3]:
-            lines.append(f"  {tl}")
+    if not qualified:
+        lines.append("No wallets passed the filters. Try lowering thresholds or using more popular tokens.")
+        return "\n".join(lines)
 
-    lines += [
-        f"", f"━━━ 🤖 ANALYSIS ━━━",
-        f"{r.get('ai_summary', '')}",
-        f"_{dev_summary}_",
-        f"", f"_Powered by Chain Sentinel • $CS_"
-    ]
+    for i, w in enumerate(qualified[:5], 1):
+        wallet = w.get("wallet", "")
+        pnl    = w.get("total_pnl_sol", 0)
+        wr     = w.get("win_rate", 0)
+        wins   = w.get("wins", 0)
+        total  = w.get("total_positions", 0)
+        trades = w.get("trade_count", 0)
+        tokens_held = w.get("tokens_held", [])
 
-    return "\n".join(lines)
+        pnl_emoji = "🟢" if pnl > 0 else "🔴"
 
-
-@require_auth
-async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /watch <contract_address>")
-        return
-    ca = context.args[0].strip()
-    add_to_watchlist(str(update.effective_user.id), ca)
-    await update.message.reply_text(f"✅ Added `{ca[:8]}...{ca[-4:]}` to your watchlist.", parse_mode="Markdown")
-
-
-@require_auth
-async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /unwatch <contract_address>")
-        return
-    removed = remove_from_watchlist(str(update.effective_user.id), context.args[0].strip())
-    if removed:
-        await update.message.reply_text(f"🗑 Removed from watchlist.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("That address wasn't in your watchlist.")
-
-
-@require_auth
-async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wl = get_watchlist(str(update.effective_user.id))
-    if not wl:
-        await update.message.reply_text("Your watchlist is empty. Use /watch <CA> to add tokens.")
-        return
-    lines = ["👁 *Your Watchlist:*\n"] + [f"{i}. `{ca}`" for i, ca in enumerate(wl, 1)]
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data.startswith("scan:"):
-        ca = query.data.split("scan:")[1]
-        await query.answer()
-        await run_scan(query, context, ca)
-        return
-    if query.data.startswith("watch:"):
-        ca = query.data.split("watch:")[1]
-        add_to_watchlist(str(query.from_user.id), ca)
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Watching", callback_data="noop"),
-            InlineKeyboardButton("🔗 Pump.fun", url=f"https://pump.fun/coin/{ca}")
-        ]]))
-
-
-async def watchlist_job(context: ContextTypes.DEFAULT_TYPE):
-    alerts = await check_watchlist_alerts()
-    for user_id, ca, message in alerts:
-        try:
-            await context.bot.send_message(chat_id=user_id, text=f"🚨 *WATCHLIST ALERT*\n\n`{ca}`\n\n{message}", parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Alert error: {e}")
-
-
-
-@require_auth
-async def dev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /dev <contract_address>\n\nExample: /dev 8JnBeGkvs1XGLquaLcrZ9i4UCPjiDa2fSR1uv6k8pump"
-        )
-        return
-    ca = context.args[0].strip()
-    msg = await update.message.reply_text(
-        f"🔎 Analysing dev history for `{ca[:8]}...{ca[-4:]}`\nThis takes ~15 seconds...",
-        parse_mode="Markdown"
-    )
-    try:
-        result = await get_dev_alpha(ca)
-
-        if result.get("error"):
-            await msg.edit_text(f"❌ {result['error']}", parse_mode="Markdown")
-            return
-
-        deployer = result.get("deployer", "Unknown")
-        token_count = result.get("token_count", 0)
-        risk = result.get("risk", "N/A")
-        risk_note = result.get("risk_note", "")
-        summary = result.get("summary", "")
-        token_lines = result.get("token_lines", [])
-        dead_count = result.get("dead_count", 0)
-        biggest = result.get("biggest_launch")
-
-        def fmt_mc(mc):
-            if not mc: return "N/A"
-            if mc >= 1_000_000: return f"${mc/1_000_000:.2f}M"
-            elif mc >= 1_000: return f"${mc/1_000:.1f}K"
-            else: return f"${mc:.0f}"
-
-        lines = [
-            f"👨‍💻 *DEV ALPHA REPORT*",
-            f"",
-            f"*Deployer:* `{deployer[:8]}...{deployer[-4:]}`",
-            f"[View on Solscan](https://solscan.io/account/{deployer})",
-            f"",
-            f"━━━ 📊 LAUNCH HISTORY (60 days) ━━━",
-            f"• Total launches: `{token_count}`",
-            f"• Dead/untraded: `{dead_count}`",
-            f"• Biggest MC: `{fmt_mc(result.get('biggest_mc', 0))}`",
-            f"",
-            f"━━━ ⚠️ DEV RISK ━━━",
-            f"• Rating: {risk}",
-            f"• Note: _{risk_note}_",
+        lines += [
+            f"━━━ 💼 WALLET #{i} ━━━",
+            f"• Address: `{wallet[:8]}...{wallet[-4:]}`",
+            f"  [Solscan](https://solscan.io/account/{wallet})",
+            f"• Total PnL: {pnl_emoji} `{pnl:+.2f} SOL`",
+            f"• Win Rate: `{wr*100:.0f}%` ({wins}/{total} positions)",
+            f"• Trades analysed: `{trades}`",
+            f"• Holds {len(tokens_held)} of your tokens",
             f"",
         ]
 
-        if token_lines:
-            lines.append("━━━ 🪙 PREVIOUS TOKENS (top 5) ━━━")
-            lines.extend(token_lines)
+        # Top 3 token PnLs
+        breakdown = w.get("token_breakdown", [])[:3]
+        if breakdown:
+            lines.append("  *Top positions:*")
+            for t in breakdown:
+                emoji = "✅" if t["win"] else "❌"
+                lines.append(
+                    f"  {emoji} `{t['mint'][:8]}...` "
+                    f"Buy: {t['bought_sol']} SOL → "
+                    f"Sell: {t['sold_sol']} SOL "
+                    f"({t['roi_pct']:+.0f}%)"
+                )
             lines.append("")
 
-        lines.append("━━━ 🤖 SUMMARY ━━━")
-        lines.append(summary)
-        lines.append("")
-        lines.append("_Powered by Chain Sentinel • $CS_")
+        # Current holdings
+        holdings = w.get("current_holdings", {})
+        if holdings:
+            held_mints = list(holdings.keys())[:3]
+            lines.append(f"  *Still holding:* {', '.join([f'`{m[:8]}...`' for m in held_mints])}")
+            lines.append("")
 
-        keyboard = [[
-            InlineKeyboardButton("🔍 Full Scan", callback_data=f"scan:{ca}"),
-            InlineKeyboardButton("👁 Solscan", url=f"https://solscan.io/account/{deployer}")
-        ]]
-
-        await msg.edit_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            disable_web_page_preview=True
-        )
-
-    except Exception as e:
-        logger.error(f"Dev alpha error: {e}")
-        await msg.edit_text("❌ Dev analysis failed. Try again in a moment.", parse_mode="Markdown")
+    lines.append("_Powered by Chain Sentinel • $CS_")
+    return "\n".join(lines)
 
 
-@require_auth
-async def smartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "🧠 *Smart Money Finder*\n\n"
-            "Find wallets holding multiple successful tokens with high win rates.\n\n"
-            "Usage: `/smartmoney <CA1> <CA2> [CA3] [CA4] [CA5]`\n\n"
-            "Example: paste 2-5 contract addresses separated by spaces.\n"
-            "_Minimum 2 CAs required._",
-            parse_mode="Markdown"
-        )
+# ═══════════════════════════════════════════════════════════════════════════════
+# STANDALONE SCRIPT MODE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def main_standalone(mints: list):
+    print(f"\n🧠 Chain Sentinel — Smart Money Finder")
+    print(f"Analysing {len(mints)} tokens...\n")
+
+    result = await find_smart_money(mints, min_win_rate=0.60, min_pnl_sol=10.0)
+
+    if result.get("error"):
+        print(f"Error: {result['error']}")
         return
 
-    mints = [a.strip() for a in context.args if len(a.strip()) >= 32]
-    if len(mints) < 2:
-        await update.message.reply_text("❌ Please provide at least 2 valid Solana contract addresses.")
-        return
+    print(format_smart_money_report(result))
 
-    msg = await update.message.reply_text(
-        f"🧠 Scanning smart money across {len(mints)} tokens...\n"
-        f"This takes 20-30 seconds...",
-        parse_mode="Markdown"
-    )
+    # Also save full JSON report
+    with open("smart_money_report.json", "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    print("\n✅ Full report saved to smart_money_report.json")
 
-    try:
-        result = await find_smart_money(mints, min_win_rate=0.55, min_pnl_sol=5.0)
-        report = format_smart_money_report(result)
-
-        # Telegram message limit is 4096 chars
-        if len(report) > 4000:
-            report = report[:3900] + "\n\n_Report truncated — too many results._"
-
-        await msg.edit_text(report, parse_mode="Markdown", disable_web_page_preview=True)
-
-    except Exception as e:
-        logger.error(f"Smart money error: {e}")
-        await msg.edit_text("❌ Smart money scan failed. Try again with different tokens.", parse_mode="Markdown")
-
-
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("scan", scan_cmd))
-    app.add_handler(CommandHandler("watch", watch_cmd))
-    app.add_handler(CommandHandler("unwatch", unwatch_cmd))
-    app.add_handler(CommandHandler("watchlist", watchlist_cmd))
-    app.add_handler(CommandHandler("dev", dev_cmd))
-    app.add_handler(CommandHandler("smartmoney", smartmoney_cmd))
-    app.add_handler(CommandHandler("genlink", genlink_cmd))
-    app.add_handler(CommandHandler("invites", invites_cmd))
-    app.add_handler(CommandHandler("adduser", adduser_cmd))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.job_queue.run_repeating(watchlist_job, interval=1800, first=60)
-    logger.info("Chain Sentinel bot is running...")
-    app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import sys
+    logging.basicConfig(level=logging.INFO)
+
+    if len(sys.argv) < 3:
+        print("Usage: python smartmoney.py <mint1> <mint2> [mint3] [mint4] [mint5]")
+        print("Example: python smartmoney.py ABC123... DEF456... GHI789...")
+        sys.exit(1)
+
+    input_mints = sys.argv[1:]
+    asyncio.run(main_standalone(input_mints))
